@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GLB viewer — WebGL</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #888;
+               font: 12px ui-monospace, monospace; color: #fff; }
+  #fps { position: fixed; top: 8px; left: 8px;
+         background: rgba(0,0,0,.5); padding: 4px 8px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div id="fps"></div>
+
+<script type="importmap">
+{ "imports": {
+  "three":          "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+  "three/addons/":  "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"
+}}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls }   from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader }      from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader }     from 'three/addons/loaders/DRACOLoader.js';
+import { KTX2Loader }      from 'three/addons/loaders/KTX2Loader.js';
+import { RGBELoader }      from 'three/addons/loaders/RGBELoader.js';
+import { EffectComposer }  from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass }      from 'three/addons/postprocessing/RenderPass.js';
+import { GTAOPass }        from 'three/addons/postprocessing/GTAOPass.js';
+import { OutputPass }      from 'three/addons/postprocessing/OutputPass.js';
+import { SSRPass }         from 'three/addons/postprocessing/SSRPass.js';  // for SSR block
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'; // for BLOOM block
+
+// renderer
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);  // 1:1 with screen pixels
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 4.0;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xcccccc);
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.05, 200);
+camera.position.set(0.75, 1.56, 1.37);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0.095, 1.638, 0.448);
+
+const pmrem = new THREE.PMREMGenerator(renderer);
+{
+  const whiteScene = new THREE.Scene();
+  whiteScene.background = new THREE.Color(0xffffff);
+  scene.environment = pmrem.fromScene(whiteScene).texture;
+  scene.background = new THREE.Color(0xffffff);
+}
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+
+// AO >>>
+const gtaoPass = new GTAOPass(scene, camera, innerWidth, innerHeight);
+gtaoPass.output = GTAOPass.OUTPUT.Default;
+gtaoPass.gtaoMaterial.defines.NORMAL_VECTOR_TYPE = 0;
+composer.addPass(gtaoPass);
+composer.addPass(new OutputPass());
+
+const aoState = {
+  samples: 2,
+  radius:  0.075,
+  scale:   1.0,
+};
+function syncGTAO() {
+  gtaoPass.updateGtaoMaterial(aoState);
+}
+syncGTAO();
+
+let aoEnabled = true;
+
+const _origGtaoRender = gtaoPass.render.bind(gtaoPass);
+gtaoPass.render = function(renderer, writeBuffer, readBuffer, deltaTime, maskActive) {
+  const restore = [];
+  scene.traverse((o) => {
+    if (!o.isMesh || !o.material) return;
+    const m = Array.isArray(o.material) ? o.material[0] : o.material;
+    if (m.transparent && o.visible) {
+      restore.push(o);
+      o.visible = false;
+    }
+  });
+  _origGtaoRender(renderer, writeBuffer, readBuffer, deltaTime, maskActive);
+  for (const o of restore) o.visible = true;
+};
+
+// SSR >>>
+const ssrPass = new SSRPass({
+  renderer, scene, camera,
+  width: innerWidth, height: innerHeight,
+  selects: [],
+  bouncing: false,
+});
+ssrPass.enabled         = true;
+ssrPass.maxDistance     = 1.0;
+ssrPass.thickness       = 0.018;
+ssrPass.opacity         = 1.0;
+ssrPass.resolutionScale = 1.0;
+composer.insertPass(ssrPass, 1);
+
+const ssrState = { roughnessThreshold: 0.4 };
+
+function ssrPopulateSelects() {
+  const selects = [];
+  scene.traverse((o) => {
+    if (!o.isMesh || !o.material) return;
+    const m = Array.isArray(o.material) ? o.material[0] : o.material;
+    if (m.roughness === undefined) return;
+    if (m.roughness <= ssrState.roughnessThreshold) selects.push(o);
+  });
+  ssrPass.selects = selects;
+  return selects.length;
+}
+
+let ssrSelectsCount = 0;
+const ssrInitInterval = setInterval(() => {
+  ssrSelectsCount = ssrPopulateSelects();
+  if (ssrSelectsCount > 0) clearInterval(ssrInitInterval);
+}, 500);
+
+const SSR_TARGET_PIXEL_RATIOS = Array.from(
+  new Set([0.25, 0.5, 0.75, 1.0, 1.5, window.devicePixelRatio])
+).sort((a, b) => a - b);
+let ssrTargetPxIdx = SSR_TARGET_PIXEL_RATIOS.indexOf(1.0);
+function applySsrResolution() {
+  const target = SSR_TARGET_PIXEL_RATIOS[ssrTargetPxIdx];
+  ssrPass.resolutionScale = Math.min(1.0, target / renderer.getPixelRatio());
+  ssrPass.setSize(innerWidth, innerHeight);
+}
+applySsrResolution();
+
+addEventListener('keydown', (e) => {
+  if (e.key === '9') renderer.toneMappingExposure = Math.max(0.05, renderer.toneMappingExposure - 0.1);
+  else if (e.key === '0') renderer.toneMappingExposure = Math.min(5.0, renderer.toneMappingExposure + 0.1);
+});
+
+addEventListener('keydown', (e) => {
+  if (e.key === 'r' || e.key === 'R') ssrPass.enabled = !ssrPass.enabled;
+  else if (e.key === 'n' || e.key === 'N') ssrPass.maxDistance = Math.max(1, ssrPass.maxDistance * 0.8);
+  else if (e.key === 'm' || e.key === 'M') ssrPass.maxDistance = Math.min(500, ssrPass.maxDistance * 1.25);
+  else if (e.key === 'c' || e.key === 'C') ssrPass.thickness = Math.max(0.001, ssrPass.thickness - 0.005);
+  else if (e.key === 'v' || e.key === 'V') ssrPass.thickness = Math.min(1.0, ssrPass.thickness + 0.005);
+  else if (e.key === 'z' || e.key === 'Z') ssrPass.opacity = Math.max(0, ssrPass.opacity - 0.1);
+  else if (e.key === 'x' || e.key === 'X') ssrPass.opacity = Math.min(1, ssrPass.opacity + 0.1);
+  else if (e.key === 'j' || e.key === 'J') {
+    ssrTargetPxIdx = Math.max(0, ssrTargetPxIdx - 1);
+    applySsrResolution();
+  }
+  else if (e.key === 'k' || e.key === 'K') {
+    ssrTargetPxIdx = Math.min(SSR_TARGET_PIXEL_RATIOS.length - 1, ssrTargetPxIdx + 1);
+    applySsrResolution();
+  }
+  else if (e.key === 'y' || e.key === 'Y') {
+    ssrState.roughnessThreshold = Math.max(0.0, ssrState.roughnessThreshold - 0.05);
+    ssrSelectsCount = ssrPopulateSelects();
+  }
+  else if (e.key === 'u' || e.key === 'U') {
+    ssrState.roughnessThreshold = Math.min(1.0, ssrState.roughnessThreshold + 0.05);
+    ssrSelectsCount = ssrPopulateSelects();
+  }
+  else if (e.key === 'b' || e.key === 'B') {
+    ssrPass.blur = !ssrPass.blur;
+  }
+  else if (e.key === '1') {
+    ssrPass.resolutionScale = Math.max(0.05, ssrPass.resolutionScale - 0.05);
+    ssrPass.setSize(innerWidth, innerHeight);
+  }
+  else if (e.key === '2') {
+    ssrPass.resolutionScale = Math.min(2.0, ssrPass.resolutionScale + 0.05);
+    ssrPass.setSize(innerWidth, innerHeight);
+  }
+});
+
+addEventListener('resize', () => applySsrResolution());
+
+const bloomPass = new UnrealBloomPass(
+  new THREE.Vector2(innerWidth, innerHeight),
+  0.4,
+  0.6,
+  1.0,
+);
+bloomPass.enabled = true;
+composer.insertPass(bloomPass, composer.passes.length - 1);
+
+addEventListener('keydown', (e) => {
+  if (e.key === 'g' || e.key === 'G') bloomPass.enabled = !bloomPass.enabled;
+  else if (e.key === 'h') bloomPass.strength = Math.max(0,   bloomPass.strength - 0.05);
+  else if (e.key === 'H') bloomPass.strength = Math.min(3,   bloomPass.strength + 0.05);
+  else if (e.key === 'f') bloomPass.radius   = Math.max(0,   bloomPass.radius   - 0.05);
+  else if (e.key === 'F') bloomPass.radius   = Math.min(2,   bloomPass.radius   + 0.05);
+  else if (e.key === 'q') bloomPass.threshold = Math.max(0,  bloomPass.threshold - 0.1);
+  else if (e.key === 'w') bloomPass.threshold = Math.min(10, bloomPass.threshold + 0.1);
+});
+
+addEventListener('resize', () => bloomPass.setSize(innerWidth, innerHeight));
+
+// loaders
+const draco = new DRACOLoader();
+draco.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/libs/draco/');
+const ktx2 = new KTX2Loader();
+ktx2.setTranscoderPath('https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/libs/basis/');
+ktx2.detectSupport(renderer);
+
+const loader = new GLTFLoader();
+loader.setDRACOLoader(draco);
+loader.setKTX2Loader(ktx2);
+
+loader.register((parser) => ({
+  name: 'KHR_materials_pbrSpecularGlossiness',
+  getMaterialType(idx) {
+    const def = parser.json.materials[idx];
+    return def.extensions?.[this.name] ? THREE.MeshStandardMaterial : null;
+  },
+  extendMaterialParams(idx, params) {
+    const def = parser.json.materials[idx];
+    const sg = def.extensions?.[this.name];
+    if (!sg) return Promise.resolve();
+    const gloss = sg.glossinessFactor ?? 1.0;
+    const spec  = sg.specularFactor || [1, 1, 1];
+    const diff  = sg.diffuseFactor  || [1, 1, 1, 1];
+    const diffAvg = (diff[0] + diff[1] + diff[2]) / 3;
+    const specMax = Math.max(spec[0], spec[1], spec[2]);
+    const isMetal = diffAvg < 0.05 && specMax > 0.5;
+    params.roughness = 1.0 - gloss;
+    params.metalness = isMetal ? 1.0 : 0.0;
+    const col = isMetal ? spec : diff.slice(0, 3);
+    params.color = new THREE.Color(col[0], col[1], col[2]);
+    if (diff[3] !== undefined && diff[3] < 1.0) {
+      params.transparent = true;
+      params.opacity = diff[3];
+    }
+    const pending = [];
+    if (sg.diffuseTexture) {
+      pending.push(parser.assignTexture(params, 'map', sg.diffuseTexture, THREE.SRGBColorSpace));
+    }
+    return Promise.all(pending);
+  },
+}));
+
+// GLB loader
+loader.load('bathroom_interior.glb', (gltf) => {
+  const root = gltf.scene;
+  const box = new THREE.Box3().setFromObject(root);
+  const c = box.getCenter(new THREE.Vector3());
+  root.position.x -= c.x;
+  root.position.y -= box.min.y;
+  root.position.z -= c.z;
+  scene.add(root);
+
+  // De-transparent over-marked materials (Blender BLEND mode quirk)
+  let fixedTransparent = 0, realTransparent = 0;
+  root.traverse((o) => {
+    if (!o.isMesh || !o.material) return;
+    const mats = Array.isArray(o.material) ? o.material : [o.material];
+    for (const m of mats) {
+      if (!m.transparent) continue;
+      if (m.opacity < 0.999 || m.alphaMap || m.alphaTest > 0) {
+        realTransparent++;
+        continue;
+      }
+      m.transparent = false;
+      m.depthWrite = true;
+      m.needsUpdate = true;
+      fixedTransparent++;
+    }
+  });
+  console.log(`materials: de-transparented ${fixedTransparent}, remaining truly-transparent ${realTransparent}`);
+
+  const LAMP_NAME = /light|lamp/i;
+  const LAMP_MIN_Y = 2.9;
+  const LAMP_INTENSITY = 8;
+  const LAMP_RANGE_MULT = 8;
+  const lamps = [];
+  root.traverse((o) => {
+    if (!LAMP_NAME.test(o.name)) return;
+    let mesh = o.isMesh ? o : null;
+    if (!mesh) o.traverse((c) => { if (!mesh && c.isMesh) mesh = c; });
+    if (!mesh) return;
+    mesh.updateMatrixWorld(true);
+    const pos = new THREE.Vector3();
+    mesh.getWorldPosition(pos);
+    if (pos.y < LAMP_MIN_Y) return;
+    const bbox = new THREE.Box3().setFromObject(mesh);
+    const size = bbox.isEmpty() ? new THREE.Vector3(0.3, 0.3, 0.3) : bbox.getSize(new THREE.Vector3());
+    const range = Math.max(size.length() * LAMP_RANGE_MULT, 3);
+
+    const mat = mesh.material;
+    let lampColor = new THREE.Color(0xffffff);
+    let lampIntensity = LAMP_INTENSITY;
+    if (mat && mat.emissive) {
+      const luma = (mat.emissive.r + mat.emissive.g + mat.emissive.b) / 3;
+      const ei = mat.emissiveIntensity ?? 1;
+      if (luma > 0.01 || ei > 1) {
+        lampIntensity = luma * ei;
+        if (luma > 0.01) lampColor = mat.emissive.clone();
+      }
+    }
+    const light = new THREE.PointLight(lampColor, lampIntensity, range, 2);
+    light.position.copy(pos);
+    scene.add(light);
+    lamps.push(light);
+  });
+  console.log(`lamps from named objects (above ${LAMP_MIN_Y}m): ${lamps.length}`);
+
+  {
+    const probePos = camera.position.clone();
+
+    function bakeProbe() {
+      const target = new THREE.WebGLCubeRenderTarget(512, {
+        type: THREE.HalfFloatType,
+        generateMipmaps: false,
+      });
+      const cam = new THREE.CubeCamera(0.05, 200, target);
+      cam.position.copy(probePos);
+      cam.update(renderer, scene);
+      const newEnv = pmrem.fromCubemap(target.texture).texture;
+      target.dispose();
+      return newEnv;
+    }
+
+    for (let pass = 0; pass < 2; pass++) {
+      const oldEnv = scene.environment;
+      scene.environment = bakeProbe();
+      if (oldEnv && oldEnv.dispose) oldEnv.dispose();
+    }
+  }
+});
+
+// loop >>>
+const fpsEl = document.getElementById('fps');
+let framesThisSec = 0;
+let secondStart = performance.now();
+let displayedFps = 0;
+let lastFrameMs = 0;
+let lastCalls = 0;
+
+function animate() {
+  const t0 = performance.now();
+  controls.update();
+
+  if (aoEnabled) {
+    composer.render();
+  } else {
+    renderer.render(scene, camera);
+  }
+
+  lastFrameMs = performance.now() - t0;
+  framesThisSec++;
+  if (t0 - secondStart >= 1000) {
+    displayedFps = framesThisSec;
+    framesThisSec = 0;
+    secondStart = t0;
+    lastCalls = renderer.info.render.calls;
+  }
+  fpsEl.textContent = `${displayedFps} fps   ${lastFrameMs.toFixed(1)}ms`;
+  requestAnimationFrame(animate);
+}
+animate();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+  gtaoPass.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
